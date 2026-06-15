@@ -1,60 +1,93 @@
-// Package walmart is the library behind the walmart command line:
-// the HTTP client, request shaping, and the typed data models for walmart.
+// Package walmart is the library behind the walmart command line: an HTTP client
+// for Walmart's public web pages and typeahead host, an optional Affiliate API
+// backend, and the typed records every command emits.
 //
-// The Client here is the spine every command shares. It sets a real
-// User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// Walmart renders its public pages server-side and ships the data as a
+// __NEXT_DATA__ JSON island, so this client GETs pages and reads that island;
+// the typeahead host answers plain JSON. Walmart fronts its estate with the
+// PerimeterX (HUMAN) bot manager, which walls almost everything from datacenter
+// IPs: only the typeahead host and the homepage answer anonymously, while the
+// product page (/ip/), keyword search (/search), the category pages (/cp/,
+// /browse), and the store pages (/store/) return the "Robot or human?" challenge.
+// So the client is two-layered: a reliable core over the open surfaces, and a
+// best-effort layer over the walled ones that returns ErrBlocked when the wall is
+// up and, if the operator has set Affiliate API credentials, falls back to that
+// documented backend. Each surface lives in its own file (search.go, product.go,
+// category.go, store.go, deals.go, suggest.go) with its parsing and record
+// mapping; this file holds the shared web client.
 package walmart
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to walmart. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "walmart/dev (+https://github.com/tamnd/walmart-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at walmart.com; change it once you
-// know the real endpoints you want to read.
-const Host = "walmart.com"
-
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
-
-// Client talks to walmart over HTTP.
+// Client talks to Walmart's public web pages. It paces requests, retries the
+// transient failures, detects the bot wall, and caches response bodies on disk
+// keyed by the request URL.
 type Client struct {
 	HTTP      *http.Client
+	BaseURL   string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
+	Delay     time.Duration
+	Retries   int
 
+	// SuggestURL is the typeahead endpoint. It defaults to the public host; tests
+	// point it at an httptest server.
+	SuggestURL string
+
+	// api is the optional Affiliate API backend, non-nil only when affiliate
+	// credentials are configured. The walled surfaces fall back to it.
+	api *apiClient
+
+	cache   *cache
+	refresh bool
+
+	mu   sync.Mutex
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// NewClient builds a client from cfg.
+func NewClient(cfg Config) *Client {
+	c := &Client{
+		HTTP:       &http.Client{Timeout: cfg.Timeout},
+		BaseURL:    cfg.BaseURL,
+		UserAgent:  cfg.UserAgent,
+		Delay:      cfg.Delay,
+		Retries:    cfg.Retries,
+		SuggestURL: typeaheadURL,
+		refresh:    cfg.Refresh,
 	}
+	if c.BaseURL == "" {
+		c.BaseURL = BaseURL
+	}
+	if c.UserAgent == "" {
+		c.UserAgent = DefaultUserAgent
+	}
+	// --refresh keeps the cache (so it is rewritten) but skips reads. --no-cache
+	// drops it entirely.
+	if !cfg.NoCache {
+		c.cache = newCache(cfg.CacheDir, cfg.CacheTTL)
+	}
+	if cfg.ConsumerID != "" && (cfg.PrivateKey != "" || cfg.PrivateKeyFile != "") {
+		c.api = newAPIClient(cfg)
+	}
+	return c
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// get fetches url and returns the response body: paced, retried, cached, and
+// wall-checked.
+func (c *Client) get(ctx context.Context, url string) ([]byte, error) {
+	if !c.refresh {
+		if b, ok := c.cache.get(url); ok {
+			return b, nil
+		}
+	}
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
 		if attempt > 0 {
@@ -64,8 +97,9 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, url, nil)
 		if err == nil {
+			c.cache.put(url, body)
 			return body, nil
 		}
 		lastErr = err
@@ -73,27 +107,49 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, lastErr
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+// do performs one GET and returns the body. retry reports whether the failure is
+// worth another attempt. header, when non-nil, is applied to the request (the
+// typeahead path sets its own).
+func (c *Client) do(ctx context.Context, url string, header http.Header) (body []byte, retry bool, err error) {
 	c.pace()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, false, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	for k, vs := range header {
+		for _, v := range vs {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
+		// A connection reset mid-handshake is how the wall sometimes drops a
+		// datacenter request; treat a transport error as retryable.
 		return nil, true, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+	switch {
+	case resp.StatusCode == http.StatusOK:
+		// fall through to read and check the body
+	case resp.StatusCode == http.StatusTooManyRequests:
+		return nil, true, ErrRateLimited
+	case resp.StatusCode == http.StatusForbidden,
+		resp.StatusCode == http.StatusPreconditionFailed:
+		// 403 and 412 are the two statuses PerimeterX serves its challenge with.
+		return nil, false, ErrBlocked
+	case resp.StatusCode == http.StatusNotFound, resp.StatusCode == http.StatusGone:
+		return nil, false, ErrNotFound
+	case resp.StatusCode >= 500:
 		return nil, true, fmt.Errorf("http %d", resp.StatusCode)
-	}
-	if resp.StatusCode != http.StatusOK {
+	default:
 		return nil, false, fmt.Errorf("http %d", resp.StatusCode)
 	}
 
@@ -101,15 +157,33 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	if err != nil {
 		return nil, true, err
 	}
+	if isInterstitial(b) {
+		return nil, false, ErrBlocked
+	}
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
+// isInterstitial reports whether a 200 body is in fact the PerimeterX bot wall,
+// which Walmart serves with a 200 status as often as a 403 or 412. The markers
+// are the challenge page title and the captcha widget and script paths the wall
+// injects.
+func isInterstitial(b []byte) bool {
+	return bytes.Contains(b, []byte("Robot or human?")) ||
+		bytes.Contains(b, []byte("px-captcha")) ||
+		bytes.Contains(b, []byte(`"redirectUrl":"/blocked`)) ||
+		bytes.Contains(b, []byte(`jsClientSrc":"/px/`)) ||
+		bytes.Contains(b, []byte(`appId":"PX`))
+}
+
+// pace blocks until at least Delay has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.Delay <= 0 {
+		c.last = time.Now()
 		return
 	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
+	if wait := c.Delay - time.Since(c.last); wait > 0 {
 		time.Sleep(wait)
 	}
 	c.last = time.Now()
@@ -123,78 +197,5 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on walmart.com. It is a stand-in for the typed records you
-// will model from the real walmart endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `walmart cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
-}
+// ClearCache removes the on-disk cache.
+func (c *Client) ClearCache() error { return c.cache.clear() }
