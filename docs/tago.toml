@@ -1,0 +1,10 @@
+title       = "walmart"
+baseURL     = "https://walmart-cli.tamnd.com/"
+description = "Read public Walmart products, search, categories, deals, and stores into structured records."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/walmart-cli"
