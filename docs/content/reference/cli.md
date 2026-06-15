@@ -8,21 +8,32 @@ weight: 10
 walmart <command> [arguments] [flags]
 ```
 
-Run `walmart <command> --help` for the full flag list on any command. This
-page is the map; keep it in step with the real command tree as you add to it.
+Run `walmart <command> --help` for the full flag list on any command.
 
 ## Commands
 
 | Command | What it does |
 |---|---|
-| `page <ref>` | Fetch a page by path or URL |
-| `links <ref>` | List the pages a page links to |
+| `search <query>` | Keyword search (best-effort, may hit the bot wall) |
+| `product <id>` | Show one product by id (best-effort, may hit the bot wall) |
+| `deals` | The current rollbacks |
+| `trending` | The trending products (needs credentials) |
+| `suggest <prefix>` | Search-box autocomplete suggestions |
+| `store show <id>` | Show a store's public profile |
+| `store find <zip>` | Find stores near a ZIP code (needs credentials) |
+| `category show <id>` | Show a category's metadata |
+| `category browse <id>` | List the items in a category |
+| `category tree [id]` | List a category's child categories (empty for the top level) |
+| `ref id <ref>` | Classify a reference into its (kind, id), offline |
+| `ref url <kind> <id>` | Build the canonical URL for a (kind, id), offline |
 | `serve [--addr]` | Serve the operations over HTTP as NDJSON |
 | `mcp` | Run as an MCP server over stdio |
 | `version` | Print the version and exit |
 
-`page` and `links` are the example operations the scaffold ships. Add a row here
-per operation you declare in `walmart/domain.go`.
+A product is addressed by its numeric item id, like `5037034321`, or an `/ip/`
+URL. A category is addressed by its numeric id, like `3944`, or a `/cp/` URL. The
+product, search, category, and store commands are walled from datacenter IPs; see
+[what anonymous access reaches](/getting-started/introduction/#what-anonymous-access-reaches).
 
 ## Global flags
 
@@ -44,7 +55,11 @@ These are shared by every operation, so they work the same on every command.
 | `-v, --verbose` | Increase verbosity (repeatable) |
 | `-q, --quiet` | Suppress progress output |
 | `--color` | `auto`, `always`, or `never` |
+| `--user-agent` | Override the User-Agent sent with each request |
+| `--zip` | ZIP code context for store and price reads |
+| `--cache-ttl` | How long a cached response stays fresh |
+| `--refresh` | Fetch fresh copies and rewrite the cache, ignoring any hit |
 
 See [output formats](/reference/output/) for what `-o`, `--fields`, and
 `--template` produce, and [configuration](/reference/configuration/) for
-environment variables and defaults.
+environment variables, the Affiliate API credentials, and defaults.

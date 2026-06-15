@@ -4,72 +4,92 @@ description: "Model a real walmart record and expose it as a command, a route, a
 weight: 10
 ---
 
-The scaffold ships one example type, `page`. Real work means modelling the
-records walmart actually serves. You do that in two files, and every surface
-updates itself.
+A walmart operation is declared once and shows up everywhere: as a CLI
+subcommand, as an HTTP route under `serve`, as an MCP tool, and as a
+`walmart://` URI a host can dereference. You add one by touching three files,
+and every surface updates itself. The `product` command is the worked example
+below.
 
 ## 1. Model the record
 
-In `walmart/walmart.go`, add a struct for the thing you are fetching
-and a client method that returns it. The `kit` struct tags decide how a host
-addresses the record:
+In `walmart/types.go`, a struct describes the thing you fetch. The `kit` and
+`table` struct tags decide how a host addresses it and how it prints:
 
 ```go
-type Item struct {
-    ID    string `json:"id"    kit:"id"`              // the URI id
-    Title string `json:"title"`
-    Body  string `json:"body"  kit:"body"`            // what cat and Markdown print
-    Owner string `json:"owner" kit:"link,kind=walmart/user"` // an edge to another record
-}
-
-func (c *Client) GetItem(ctx context.Context, id string) (*Item, error) {
-    body, err := c.Get(ctx, BaseURL+"/items/"+id+".json")
-    if err != nil {
-        return nil, err
-    }
-    // decode body into an Item ...
-    return item, nil
+type Product struct {
+    ID           string   `json:"id" kit:"id"`              // the URI id
+    Name         string   `json:"name"`
+    Brand        string   `json:"brand,omitempty"`
+    Price        float64  `json:"price,omitempty"`
+    Currency     string   `json:"currency,omitempty"`
+    Availability string   `json:"availability,omitempty"`
+    Description  string   `json:"description,omitempty" kit:"body"` // what cat and Markdown print
+    URL          string   `json:"url,omitempty"`
 }
 ```
 
 - `kit:"id"` marks the field that becomes the URI id.
 - `kit:"body"` marks the prose that `cat` and the Markdown export render.
-- `kit:"link,kind=<scheme>/<type>"` marks an outbound edge. It can point at
-  another walmart type or at another site entirely, which is what lets a
-  host walk the graph across tools.
+- `json:",omitempty"` keeps a record honest: a field Walmart did not serve is
+  absent rather than zero.
 
-## 2. Declare the operation
+## 2. Fetch it
 
-In `walmart/domain.go`, add an input struct and a handler, then register
-it in `Register`:
+In `walmart/product.go`, a client method returns the record. The two-layer
+client hides whether the data came from the public page or the Affiliate API
+fallback:
 
 ```go
-type itemRef struct {
-    Ref    string  `kit:"arg" help:"item id or URL"`
+func (c *Client) GetProduct(ctx context.Context, ref string) (*Product, error) {
+    id := productID(ref) // accept a bare id or an /ip/ URL
+    body, err := c.get(ctx, c.BaseURL+"/ip/"+id)
+    if err != nil {
+        return nil, err // ErrBlocked, ErrRateLimited, ErrNotFound flow up unchanged
+    }
+    // parse __NEXT_DATA__ into a Product ...
+    return p, nil
+}
+```
+
+## 3. Declare the operation
+
+In `walmart/ops.go`, add an input struct and a handler. The struct tags tell
+`kit` what is a positional argument, what is an inherited flag, and where the
+client is injected:
+
+```go
+type productRef struct {
+    ID     string  `kit:"arg" help:"item id or /ip/ URL"`
     Client *Client `kit:"inject"`
 }
 
-func getItem(ctx context.Context, in itemRef, emit func(*Item) error) error {
-    it, err := in.Client.GetItem(ctx, in.Ref)
+func getProduct(ctx context.Context, in productRef, emit func(*Product) error) error {
+    p, err := in.Client.GetProduct(ctx, in.ID)
     if err != nil {
         return mapErr(err)
     }
-    return emit(it)
+    return emit(p)
 }
+```
 
-// inside Register(app):
-kit.Handle(app, kit.OpMeta{Name: "item", Group: "read", Single: true,
-    Summary: "Fetch an item by id or URL", URIType: "item", Resolver: true,
-    Args: []kit.Arg{{Name: "ref", Help: "item id or URL"}}}, getItem)
+Then register it in `Register` in `walmart/domain.go`:
+
+```go
+kit.Handle(app, kit.OpMeta{
+    Name: "product", Group: "read", Single: true,
+    Summary: "Show one product by id",
+    URIType: "product", Resolver: true,
+    Args: []kit.Arg{{Name: "id", Help: "item id or /ip/ URL"}},
+}, getProduct)
 ```
 
 That is the whole change. `kit.Handle` reflects the input for flags and the
 output for the record shape, so the operation immediately becomes:
 
 ```bash
-walmart item <id>                 # the command
-curl 'localhost:7777/v1/item/<id>'      # the route, under serve
-ant get walmart://item/<id>       # the URI dereference, via a host
+walmart product 5037034321              # the command
+curl 'localhost:7777/v1/product/5037034321'   # the route, under serve
+ant get walmart://product/5037034321    # the URI dereference, via a host
 ```
 
 ## Resolver ops and list ops
@@ -77,22 +97,27 @@ ant get walmart://item/<id>       # the URI dereference, via a host
 Two flags shape how a host treats an operation:
 
 - **`Single: true`** with **`Resolver: true`** marks the canonical one-record
-  fetch for a `URIType`. It answers `ant get`.
+  fetch for a `URIType`. It answers `ant get`. `product`, `store show`, and
+  `category show` are the resolvers.
 - **`List: true`** marks a member-lister for a parent resource. It answers
-  `ant ls`. A list op should emit records that are themselves addressable
-  (often a lightweight stub of a resolver type), so every member is a URI a host
-  can follow. The example `links` op does this with page stubs.
+  `ant ls`. A list op emits records that are themselves addressable, so every
+  member is a URI a host can follow. `search`, `category browse`, and
+  `category tree` do this, each tagged with the `URIType` of the members it
+  emits (`product` for `search` and `browse`, `category` for `tree`).
 
 ## Map errors to exit codes
 
-Return the `errs` kinds from `mapErr` so every surface reports the same outcome
-with the same exit code:
+Return through `mapErr` so every surface reports the same outcome with the same
+exit code: the bot wall reads as need-auth (exit 4), a throttle as rate-limited
+(exit 5), a missing item as not-found (exit 6):
 
 ```go
-case errors.Is(err, ErrNotFound):
-    return errs.NotFound("%s", err.Error())
+case errors.Is(err, ErrBlocked):
+    return errs.NeedAuth("%s", err.Error())
 case errors.Is(err, ErrRateLimited):
     return errs.RateLimited("%s", err.Error())
+case errors.Is(err, ErrNotFound):
+    return errs.NotFound("%s", err.Error())
 ```
 
 See [output formats](/reference/output/) for how records render, and
