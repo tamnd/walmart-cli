@@ -95,18 +95,21 @@ func (c *Client) CategoryTree(ctx context.Context, ref string, limit int) ([]*Ca
 	if derr != nil {
 		return nil, derr
 	}
-	return parseCategoryLinks(doc, limit), nil
+	// On a specific category page the department links are that node's children,
+	// so they carry an edge back up to it; on the homepage there is no parent.
+	return parseCategoryLinks(doc, id, limit), nil
 }
 
 // parseCategoryLinks scans the /cp/ links on a page into Category stubs, deduped
-// by id, in document order.
-func parseCategoryLinks(doc *goquery.Document, limit int) []*Category {
+// by id, in document order. parentID is the id of the page being scanned, set as
+// each stub's parent edge, or "" for the homepage where the links are top-level.
+func parseCategoryLinks(doc *goquery.Document, parentID string, limit int) []*Category {
 	var out []*Category
 	seen := map[string]bool{}
 	doc.Find(`a[href*="/cp/"]`).EachWithBreak(func(_ int, a *goquery.Selection) bool {
 		href, _ := a.Attr("href")
 		id := categoryIDFrom(href)
-		if id == "" || seen[id] {
+		if id == "" || seen[id] || id == parentID {
 			return true
 		}
 		name := squish(a.Text())
@@ -114,7 +117,7 @@ func parseCategoryLinks(doc *goquery.Document, limit int) []*Category {
 			return true
 		}
 		seen[id] = true
-		out = append(out, &Category{ID: id, Name: name, URL: BaseURL + "/cp/" + id})
+		out = append(out, &Category{ID: id, Name: name, ParentID: parentID, URL: BaseURL + "/cp/" + id})
 		return limit <= 0 || len(out) < limit
 	})
 	return out

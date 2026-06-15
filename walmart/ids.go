@@ -71,6 +71,16 @@ func URLFor(kind, id string) string {
 	}
 }
 
+// catIDFromURL returns the category id named by a /cp/ or /browse URL or path,
+// or "" when the reference is not a category. It powers the category edge a
+// product's breadcrumb carries.
+func catIDFromURL(u string) string {
+	if r := Classify(u); r.Kind == "category" {
+		return r.ID
+	}
+	return ""
+}
+
 // productID reduces a reference to its bare product id.
 func productID(ref string) string {
 	if r := Classify(ref); r.Kind == "product" {

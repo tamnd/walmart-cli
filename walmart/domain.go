@@ -70,11 +70,14 @@ func (Domain) Register(app *kit.App) {
 	app.CommandGroup("category", "Read a category, its items, and its children")
 	app.CommandGroup("ref", "Resolve references to ids and URLs (offline)")
 
-	// Top-level reads.
+	// Top-level reads. Each list op names its own collection authority, distinct
+	// from the product resolver, so `ant ls walmart://search/<q>`,
+	// walmart://deals, and walmart://trending each reach the right op rather than
+	// shadowing one another; every member they emit links back to its product.
 	kit.Handle(app, kit.OpMeta{
 		Name: "search", Group: "read", List: true,
 		Summary: "Search products by keyword",
-		URIType: "product",
+		URIType: "search",
 		Args:    []kit.Arg{{Name: "query", Help: "search keywords"}},
 	}, search)
 
@@ -88,13 +91,13 @@ func (Domain) Register(app *kit.App) {
 	kit.Handle(app, kit.OpMeta{
 		Name: "deals", Group: "read", List: true,
 		Summary: "The current rollbacks",
-		URIType: "product",
+		URIType: "deals",
 	}, deals)
 
 	kit.Handle(app, kit.OpMeta{
 		Name: "trending", Group: "read", List: true,
 		Summary: "The trending products",
-		URIType: "product",
+		URIType: "trending",
 	}, trending)
 
 	kit.Handle(app, kit.OpMeta{
@@ -114,7 +117,7 @@ func (Domain) Register(app *kit.App) {
 	kit.Handle(app, kit.OpMeta{
 		Name: "find", Parent: "store", List: true,
 		Summary: "Find stores near a ZIP code",
-		URIType: "store",
+		URIType: "stores", // ls walmart://stores/<zip>, distinct from the store resolver
 		Args:    []kit.Arg{{Name: "zip", Help: "a US ZIP code"}},
 	}, findStores)
 
@@ -126,17 +129,20 @@ func (Domain) Register(app *kit.App) {
 		Args: []kit.Arg{{Name: "id", Help: "category id or /cp/ URL"}},
 	}, getCategory)
 
+	// browse enumerates a category's items, so `ant ls walmart://category/<id>`
+	// yields its products; tree enumerates its child nodes under a distinct
+	// authority, so the items list and the taxonomy recursion never collide.
 	kit.Handle(app, kit.OpMeta{
 		Name: "browse", Parent: "category", List: true,
 		Summary: "List the items in a category",
-		URIType: "product",
+		URIType: "category",
 		Args:    []kit.Arg{{Name: "id", Help: "category id or /cp/ URL"}},
 	}, categoryBrowse)
 
 	kit.Handle(app, kit.OpMeta{
 		Name: "tree", Parent: "category", List: true,
 		Summary: "List a category's child categories",
-		URIType: "category",
+		URIType: "categories",
 		Args:    []kit.Arg{{Name: "id", Help: "category id or /cp/ URL (empty for the top level)", Optional: true}},
 	}, categoryTree)
 

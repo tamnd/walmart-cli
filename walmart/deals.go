@@ -52,6 +52,7 @@ func dealsFromListings(listings []*Listing) []*Deal {
 			Reviews:  l.Reviews,
 			Image:    l.Thumbnail,
 			URL:      l.URL,
+			Item:     l.ID,
 		}
 		if l.Was > l.Price {
 			d.Save = l.Was - l.Price

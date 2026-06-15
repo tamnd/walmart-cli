@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -167,6 +168,8 @@ type apiItem struct {
 	BrandName        string          `json:"brandName"`
 	ModelNumber      string          `json:"modelNumber"`
 	CategoryPath     string          `json:"categoryPath"`
+	CategoryNode     string          `json:"categoryNode"` // colon/underscore-joined category ids, leaf last
+	Variants         json.RawMessage `json:"variants"`     // sibling item ids (numbers or strings)
 	ShortDescription string          `json:"shortDescription"`
 	LongDescription  string          `json:"longDescription"`
 	ThumbnailImage   string          `json:"thumbnailImage"`
@@ -186,6 +189,52 @@ type apiItem struct {
 
 func (it apiItem) id() string       { return jsonNumString(it.ItemID) }
 func (it apiItem) currency() string { return "USD" }
+
+// categoryID returns the leaf category id from categoryNode, whose ids Walmart
+// joins with ":" or "_" with the leaf last (e.g. "0:3944:1078524").
+func (it apiItem) categoryID() string {
+	return lastIDSegment(it.CategoryNode)
+}
+
+// trail splits the human-readable categoryPath ("Electronics/Cell Phones") into
+// its names, root first, leaf last.
+func (it apiItem) trail() []string {
+	if it.CategoryPath == "" {
+		return nil
+	}
+	var out []string
+	for _, s := range strings.Split(it.CategoryPath, "/") {
+		if s = strings.TrimSpace(s); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// variantIDs reads the variants array, which Walmart returns as item ids that may
+// be numbers or quoted numbers, into a sorted, deduped, self-excluding list.
+func (it apiItem) variantIDs() []string {
+	if len(it.Variants) == 0 {
+		return nil
+	}
+	var raws []json.RawMessage
+	if json.Unmarshal(it.Variants, &raws) != nil {
+		return nil
+	}
+	self := it.id()
+	seen := map[string]bool{}
+	var out []string
+	for _, r := range raws {
+		v := jsonNumString(r)
+		if v == "" || v == self || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
 
 func (it apiItem) availability() string {
 	if it.Stock != "" {
@@ -221,6 +270,7 @@ func (it apiItem) toListing() *Listing {
 		Thumbnail:    it.ThumbnailImage,
 		URL:          it.url(),
 	}
+	l.Item = l.ID
 	if it.Msrp > it.SalePrice {
 		l.Was = it.Msrp
 	}
@@ -242,6 +292,9 @@ func (it apiItem) toProduct() *Product {
 		Rating:       rawFloat(it.CustomerRating),
 		Reviews:      it.NumReviews,
 		Category:     lastPath(it.CategoryPath),
+		CategoryID:   it.categoryID(),
+		Trail:        it.trail(),
+		Variants:     it.variantIDs(),
 		Description:  stripHTML(firstNonEmpty(it.ShortDescription, it.LongDescription)),
 		URL:          it.url(),
 	}
@@ -272,6 +325,7 @@ func (it apiItem) toDeal() *Deal {
 		Image:    firstNonEmpty(it.LargeImage, it.MediumImage, it.ThumbnailImage),
 		URL:      it.url(),
 		Offer:    "Rollback",
+		Item:     it.id(),
 	}
 	if it.Msrp > it.SalePrice {
 		d.Was = it.Msrp
@@ -380,21 +434,23 @@ func (a *apiClient) Taxonomy(ctx context.Context, id string, limit int) ([]*Cate
 		return nil, err
 	}
 	nodes := resp.Categories
-	parent := ""
+	parent, parentID := "", ""
 	if id != "" {
 		n := findCategory(resp.Categories, id)
 		if n == nil {
 			return nil, ErrNotFound
 		}
-		nodes, parent = n.Children, n.Name
+		nodes, parent, parentID = n.Children, n.Name, n.ID
 	}
 	var out []*Category
 	for _, n := range nodes {
 		out = append(out, &Category{
-			ID:     n.ID,
-			Name:   n.Name,
-			Parent: parent,
-			URL:    BaseURL + "/cp/" + n.ID,
+			ID:       n.ID,
+			Name:     n.Name,
+			Parent:   parent,
+			ParentID: parentID,
+			Children: childIDs(n.Children),
+			URL:      BaseURL + "/cp/" + n.ID,
 		})
 		if limit > 0 && len(out) >= limit {
 			break
@@ -415,14 +471,50 @@ func (a *apiClient) GetCategory(ctx context.Context, id string) (*Category, erro
 	if n == nil {
 		return nil, ErrNotFound
 	}
-	cat := &Category{ID: n.ID, Name: n.Name, URL: BaseURL + "/cp/" + n.ID}
+	cat := &Category{ID: n.ID, Name: n.Name, Children: childIDs(n.Children), URL: BaseURL + "/cp/" + n.ID}
 	if n.Path != "" {
 		cat.Trail = strings.Split(n.Path, "/")
 		if len(cat.Trail) > 1 {
 			cat.Parent = cat.Trail[len(cat.Trail)-2]
 		}
 	}
+	if p := findParent(resp.Categories, id); p != nil {
+		cat.ParentID = p.ID
+		if cat.Parent == "" {
+			cat.Parent = p.Name
+		}
+	}
 	return cat, nil
+}
+
+// childIDs lists the ids of a node's immediate children.
+func childIDs(nodes []apiCategory) []string {
+	if len(nodes) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(nodes))
+	for _, n := range nodes {
+		if n.ID != "" {
+			out = append(out, n.ID)
+		}
+	}
+	return out
+}
+
+// findParent returns the node whose immediate children include id, or nil for a
+// top-level node with no parent.
+func findParent(nodes []apiCategory, id string) *apiCategory {
+	for i := range nodes {
+		for j := range nodes[i].Children {
+			if nodes[i].Children[j].ID == id {
+				return &nodes[i]
+			}
+		}
+		if p := findParent(nodes[i].Children, id); p != nil {
+			return p
+		}
+	}
+	return nil
 }
 
 func findCategory(nodes []apiCategory, id string) *apiCategory {
@@ -508,6 +600,18 @@ func lastPath(s string) string {
 	}
 	parts := strings.Split(s, "/")
 	return strings.TrimSpace(parts[len(parts)-1])
+}
+
+// lastIDSegment returns the last all-digit segment of a categoryNode, whose ids
+// Walmart joins with ":" or "_" (e.g. "0:3944:1078524" or "3944_1078524").
+func lastIDSegment(s string) string {
+	id := ""
+	for _, seg := range strings.FieldsFunc(s, func(r rune) bool { return r == ':' || r == '_' }) {
+		if isDigits(seg) {
+			id = seg
+		}
+	}
+	return id
 }
 
 // firstNonEmpty returns the first non-empty string among its arguments.

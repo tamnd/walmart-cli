@@ -281,6 +281,13 @@ ant get walmart://category/<id>       # fetch a category
 ant url walmart://category/<id>       # the live https URL
 ```
 
+Records carry explicit edges, so a host can breadth-first crawl the graph and
+write it to disk: a listing or deal links to its product, a product links to its
+category and its variant siblings, and a category links to its parent and
+children. `ant export <uri> --follow N` walks those edges. See the
+[resource-URI guide](https://walmart-cli.tamnd.com/guides/resource-uris/) for the
+full edge map.
+
 ## Development
 
 ```
