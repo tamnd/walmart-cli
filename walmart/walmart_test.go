@@ -48,7 +48,8 @@ const productPage = `<html><head>
     "shortDescription":"<p>A great phone.</p>",
     "priceInfo":{"currentPrice":{"price":549.99,"currencyUnit":"USD"},"wasPrice":{"price":699},"listPrice":{"price":799}},
     "imageInfo":{"thumbnailUrl":"https://i5.walmartimages.com/a.jpg","allImages":[{"url":"https://i5.walmartimages.com/a.jpg"},{"url":"https://i5.walmartimages.com/b.jpg"}]},
-    "category":{"path":[{"name":"Electronics"},{"name":"Cell Phones"}]}},
+    "category":{"path":[{"name":"Electronics","url":"/cp/electronics/3944"},{"name":"Cell Phones","url":"/cp/cell-phones/1105910"}]},
+    "variantsMap":{"v1":{"usItemId":"123456789012"},"v2":{"usItemId":"999000111222"},"v3":{"usItemId":"888000111222"}}},
   "reviews":{"averageOverallRating":4.5,"totalReviewCount":1234}
 }}}}}
 </script></head><body>iPhone</body></html>`
@@ -81,6 +82,19 @@ func TestGetProduct(t *testing.T) {
 	}
 	if p.Category != "Cell Phones" {
 		t.Errorf("category leaf = %q", p.Category)
+	}
+	// The leaf url carries the category id, so the product links to its category
+	// for BFS; the trail keeps the human path.
+	if p.CategoryID != "1105910" {
+		t.Errorf("category id (edge) = %q", p.CategoryID)
+	}
+	if len(p.Trail) != 2 || p.Trail[0] != "Electronics" || p.Trail[1] != "Cell Phones" {
+		t.Errorf("trail = %v", p.Trail)
+	}
+	// The variantsMap names sibling item ids; self is dropped and the rest sorted,
+	// so the product links to its other variants.
+	if len(p.Variants) != 2 || p.Variants[0] != "888000111222" || p.Variants[1] != "999000111222" {
+		t.Errorf("variants (edges) = %v", p.Variants)
 	}
 	if p.Description != "A great phone." {
 		t.Errorf("description = %q", p.Description)
@@ -123,6 +137,11 @@ func TestSearch(t *testing.T) {
 	a := got[0]
 	if a.ID != "111111111" || a.Title != "Item One" || a.Brand != "BrandA" {
 		t.Errorf("listing 0 = %+v", a)
+	}
+	// Every listing links to its full product for BFS, so the grid item id is also
+	// its product edge.
+	if a.Item != a.ID {
+		t.Errorf("listing item edge = %q, want %q", a.Item, a.ID)
 	}
 	if a.Price != 12.99 || a.Was != 19.99 || a.Currency != "USD" {
 		t.Errorf("price = %v was %v %q", a.Price, a.Was, a.Currency)

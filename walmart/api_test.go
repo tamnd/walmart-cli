@@ -111,12 +111,88 @@ func TestAPISearchItems(t *testing.T) {
 	if l.Availability != "Available" || l.Rating != 4.5 {
 		t.Errorf("availability/rating = %q / %v", l.Availability, l.Rating)
 	}
+	// Every search result links to its full product for BFS.
+	if l.Item != l.ID {
+		t.Errorf("listing item edge = %q, want %q", l.Item, l.ID)
+	}
+}
+
+// taxonomyJSON is a two-level slice of the taxonomy tree: one department with two
+// children, used to prove the parent and child edges are filled.
+const taxonomyJSON = `{"categories":[
+  {"id":"3944","name":"Electronics","path":"Electronics","children":[
+    {"id":"1105910","name":"Cell Phones","path":"Electronics/Cell Phones","children":[]},
+    {"id":"3951","name":"TV & Video","path":"Electronics/TV & Video","children":[]}
+  ]}
+]}`
+
+// TestAPITaxonomy proves the taxonomy children carry the edges that let a host
+// walk the category tree both ways: each child names its parent and its own
+// children.
+func TestAPITaxonomy(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(taxonomyJSON))
+	}))
+	defer ts.Close()
+
+	a := newAPIClient(Config{ConsumerID: "c", KeyVersion: "1", PrivateKey: testKeyPEM(t)})
+	a.base = ts.URL
+
+	got, err := a.Taxonomy(context.Background(), "3944", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 children of Electronics, got %d", len(got))
+	}
+	c := got[0]
+	if c.ID != "1105910" || c.Name != "Cell Phones" {
+		t.Errorf("child 0 = %+v", c)
+	}
+	// The child links back up to the queried parent for upward BFS.
+	if c.ParentID != "3944" || c.Parent != "Electronics" {
+		t.Errorf("parent edge = %q / %q", c.ParentID, c.Parent)
+	}
+}
+
+// TestAPIGetCategoryEdges proves GetCategory fills both the parent edge (found by
+// scanning the tree) and the child edges.
+func TestAPIGetCategoryEdges(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(taxonomyJSON))
+	}))
+	defer ts.Close()
+
+	a := newAPIClient(Config{ConsumerID: "c", KeyVersion: "1", PrivateKey: testKeyPEM(t)})
+	a.base = ts.URL
+
+	cat, err := a.GetCategory(context.Background(), "3944")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cat.ID != "3944" || cat.Name != "Electronics" {
+		t.Errorf("category = %+v", cat)
+	}
+	if len(cat.Children) != 2 || cat.Children[0] != "1105910" || cat.Children[1] != "3951" {
+		t.Errorf("child edges = %v", cat.Children)
+	}
+
+	leaf, err := a.GetCategory(context.Background(), "1105910")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The leaf has a parent in the tree, so its parent edge is filled.
+	if leaf.ParentID != "3944" {
+		t.Errorf("leaf parent edge = %q, want 3944", leaf.ParentID)
+	}
 }
 
 func TestAPIGetItem(t *testing.T) {
 	const itemJSON = `{"itemId":12345,"name":"Apple iPhone 13","salePrice":499.99,"msrp":599,
 	  "brandName":"Apple","modelNumber":"MLPF3LL/A","upc":"194252707357","stock":"Available",
-	  "categoryPath":"Electronics/Cell Phones","shortDescription":"<p>A great phone.</p>",
+	  "categoryPath":"Electronics/Cell Phones","categoryNode":"0:3944:1105910",
+	  "variants":[12345,"67890",54321],
+	  "shortDescription":"<p>A great phone.</p>",
 	  "largeImage":"https://i5/l.jpg","numReviews":10,"customerRating":4.5}`
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte(itemJSON))
@@ -138,6 +214,18 @@ func TestAPIGetItem(t *testing.T) {
 	}
 	if p.Category != "Cell Phones" {
 		t.Errorf("category leaf = %q", p.Category)
+	}
+	// categoryNode's leaf id is the category edge; categoryPath is the human trail.
+	if p.CategoryID != "1105910" {
+		t.Errorf("category id (edge) = %q", p.CategoryID)
+	}
+	if len(p.Trail) != 2 || p.Trail[0] != "Electronics" || p.Trail[1] != "Cell Phones" {
+		t.Errorf("trail = %v", p.Trail)
+	}
+	// variants drops self (12345) and sorts the rest, so the product links to its
+	// sibling variants only.
+	if len(p.Variants) != 2 || p.Variants[0] != "54321" || p.Variants[1] != "67890" {
+		t.Errorf("variants (edges) = %v", p.Variants)
 	}
 	if p.Description != "A great phone." {
 		t.Errorf("description = %q", p.Description)

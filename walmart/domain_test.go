@@ -162,3 +162,45 @@ func TestHostWiring(t *testing.T) {
 		t.Errorf("ResolveOn = (%q, %v), want walmart://product/123456789012", got.String(), err)
 	}
 }
+
+// TestHostLinks proves the graph edges a host walks for BFS: a product links to
+// its category and to each sibling variant, a listing and a deal link to their
+// full product, and a category links to its parent and each child. These are the
+// edges `ant export --follow` traverses to crawl the whole site.
+func TestHostLinks(t *testing.T) {
+	h, err := kit.Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	links := func(rec any) []string {
+		var out []string
+		for _, u := range h.Links(rec) {
+			out = append(out, u.String())
+		}
+		return out
+	}
+	has := func(t *testing.T, got []string, want string) {
+		t.Helper()
+		for _, g := range got {
+			if g == want {
+				return
+			}
+		}
+		t.Errorf("missing edge %q in %v", want, got)
+	}
+
+	p := &Product{ID: "123456789012", CategoryID: "1105910", Variants: []string{"54321", "67890"}}
+	pl := links(p)
+	has(t, pl, "walmart://category/1105910")
+	has(t, pl, "walmart://product/54321")
+	has(t, pl, "walmart://product/67890")
+
+	has(t, links(&Listing{ID: "111", Item: "111"}), "walmart://product/111")
+	has(t, links(&Deal{ID: "222", Item: "222"}), "walmart://product/222")
+
+	c := &Category{ID: "1105910", ParentID: "3944", Children: []string{"3951"}}
+	cl := links(c)
+	has(t, cl, "walmart://category/3944")
+	has(t, cl, "walmart://category/3951")
+}

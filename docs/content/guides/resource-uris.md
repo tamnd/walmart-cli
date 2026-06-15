@@ -47,19 +47,57 @@ ant resolve https://www.walmart.com/cp/electronics/3944  # a pasted link, back t
 hit Walmart's bot wall and report need-auth, the same as the matching commands.
 See [what anonymous access reaches](/getting-started/introduction/#what-anonymous-access-reaches).
 
-## Walking the graph
+## Collections
 
-`ls` lists the members of a collection, and every member is itself an
-addressable URI, so a host can follow the graph and write it to disk:
+`ls` lists the members of a collection. Each list operation has its own
+authority, so they never shadow one another:
+
+| URI                          | What it lists                          |
+| ---------------------------- | -------------------------------------- |
+| `walmart://search/<query>`   | products matching a keyword            |
+| `walmart://category/<id>`    | the items in a category                |
+| `walmart://categories/<id>`  | a category's child categories          |
+| `walmart://stores/<zip>`     | stores near a ZIP code                 |
+| `walmart://deals`            | the current rollbacks                  |
+| `walmart://trending`         | the trending products                  |
 
 ```bash
-ant ls     walmart://category/3944          # the items in the category, as product URIs
-ant export walmart://category/3944 --follow 1 --to ./data
+ant ls walmart://search/cordless%20drill     # products matching the keyword
+ant ls walmart://category/3944               # the items in the category
+ant ls walmart://categories/3944             # the child categories
 ```
 
-The list operations (`search`, `category browse`, `category tree`, `deals`,
-`trending`) emit records that are themselves addressable, so each member is a
-`walmart://product/` or `walmart://category/` URI a host can fetch in turn.
+## Walking the graph
+
+Every record carries explicit edges to the records it points at, so a host can
+breadth-first crawl the site and write it to disk without scraping URLs out of
+free text. The edges are:
+
+| From       | Field        | Edge to                          |
+| ---------- | ------------ | -------------------------------- |
+| `Listing`  | `item`       | `walmart://product/<id>`         |
+| `Deal`     | `item`       | `walmart://product/<id>`         |
+| `Product`  | `category_id`| `walmart://category/<id>`        |
+| `Product`  | `variants`   | `walmart://product/<id>` (each sibling) |
+| `Category` | `parent_id`  | `walmart://category/<id>` (up)   |
+| `Category` | `children`   | `walmart://category/<id>` (down, each) |
+
+A search result or a category page links straight through to the full product;
+a product links up to its leaf category and across to its colour, size, and
+configuration siblings; a category links both up to its parent and down to its
+children. Starting from any node, `--follow` walks these edges:
+
+```bash
+ant export walmart://categories/ --follow 3 --to ./data   # crawl the taxonomy down three levels
+ant export walmart://product/5037034321 --follow 1 --to ./data  # a product, its category, and its variants
+```
+
+Each record is written under its minted URI with its edges intact, so the saved
+set reconstructs the slice of the site that was reached: the category tree, the
+products in each category, and the variant clusters that tie products together.
+
+These edge fields stay out of the table and CSV views (they would be noise in a
+terminal) but are always present in the JSON and JSONL a host reads.
 
 ## Why this is the same code
 

@@ -3,6 +3,7 @@ package walmart
 import (
 	"bytes"
 	"encoding/json"
+	"sort"
 	"strconv"
 )
 
@@ -81,8 +82,14 @@ type ndProduct struct {
 	Category         *struct {
 		Path []struct {
 			Name string `json:"name"`
+			URL  string `json:"url"`
 		} `json:"path"`
 	} `json:"category"`
+	// variantsMap keys each colour/size/configuration sibling by a variant id;
+	// each value carries the sibling's own usItemId, the edge a host follows.
+	VariantsMap map[string]struct {
+		UsItemID string `json:"usItemId"`
+	} `json:"variantsMap"`
 }
 
 type ndGridItem struct {
@@ -233,8 +240,26 @@ func parseProduct(nd []byte, id string) *Product {
 		}
 	}
 	if pp.Category != nil && len(pp.Category.Path) > 0 {
-		p.Category = pp.Category.Path[len(pp.Category.Path)-1].Name
+		path := pp.Category.Path
+		for _, node := range path {
+			if node.Name != "" {
+				p.Trail = append(p.Trail, node.Name)
+			}
+		}
+		leaf := path[len(path)-1]
+		p.Category = leaf.Name
+		p.CategoryID = catIDFromURL(leaf.URL)
 	}
+	seenVar := map[string]bool{}
+	for _, v := range pp.VariantsMap {
+		if v.UsItemID == "" || v.UsItemID == p.ID || seenVar[v.UsItemID] {
+			continue
+		}
+		seenVar[v.UsItemID] = true
+		p.Variants = append(p.Variants, v.UsItemID)
+	}
+	// variantsMap iterates in random order; sort so the edge list is stable.
+	sort.Strings(p.Variants)
 	p.Description = stripHTML(pp.ShortDescription)
 	if p.Description == "" {
 		if idml := root.Props.PageProps.InitialData.Data.Idml; idml != nil {
@@ -298,7 +323,7 @@ func (it ndGridItem) toListing() *Listing {
 	if id == "" || !isDigits(id) {
 		return nil
 	}
-	l := &Listing{ID: id, URL: BaseURL + "/ip/" + id}
+	l := &Listing{ID: id, Item: id, URL: BaseURL + "/ip/" + id}
 	if it.CanonicalURL != "" {
 		l.URL = BaseURL + it.CanonicalURL
 	}
